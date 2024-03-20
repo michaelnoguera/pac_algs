@@ -1,8 +1,14 @@
+from typing import Callable, Iterable, NamedTuple, Optional, Set, Union, List, Tuple
 from sklearn.cluster import KMeans
 from sklearn.utils import shuffle
 from sklearn.decomposition import PCA
 from sklearn import svm
 import numpy as np
+import pandas as pd
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial import distance
+from sklearn.datasets import make_blobs
+import copy
 import pickle
 import os
 import pandas as pd
@@ -22,14 +28,24 @@ from sklearn import tree
 from sklearn import preprocessing
 from itertools import product
 
+
+class TrainData(NamedTuple):
+    train_x: np.ndarray
+    train_y: np.ndarray
+    num_classes: int
+
 # GET SAMPLES PER CLASS
-def get_samples_safe(shuffled_x, shuffled_y, num_classes, subsample_rate, ordered=False):
-    init_seed_samples = []
-    init_y = []
-    seen = set()
-    seeded_x = copy.deepcopy(shuffled_x)
-    seeded_y = copy.deepcopy(shuffled_y)
-    remaining = subsample_rate - num_classes
+def get_samples_safe(shuffled_x: np.ndarray, 
+                     shuffled_y: np.ndarray, 
+                     num_classes: int, 
+                     subsample_rate: int, 
+                     ordered: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    init_seed_samples: np.ndarray = []
+    init_y: List[Union[np.ndarray, int, float]] = []  # Union to accommodate different types based on ordered
+    seen: Set[int] = set()
+    seeded_x: np.ndarray = copy.deepcopy(shuffled_x)
+    seeded_y: np.ndarray = copy.deepcopy(shuffled_y)
+    remaining: int = subsample_rate - num_classes
 
     assert remaining > 0
 
@@ -60,17 +76,33 @@ def get_samples_safe(shuffled_x, shuffled_y, num_classes, subsample_rate, ordere
 
 # NOISE MECHANISMS
 
-def calc_r(train_x):
-    max_l2_norm = None
-    for x in train_x:
-        if max_l2_norm is None or np.linalg.norm(x) > max_l2_norm:
-            max_l2_norm = np.linalg.norm(x)
+def calc_r(train_x: Union[np.ndarray, Iterable[Iterable[float]]]) -> float:
+    """
+    Compute the maximum L2 norm of the training data
+    """
+    max_l2_norm: float = max(np.linalg.norm(x) for x in train_x)
     return max_l2_norm
 
-def rand_mechanism_noise(train_x, train_y, mechanism, subsample_rate, tau, num_classes, regularize=False, tree_depth=None,
-    num_trees=None, num_dims=None, prefix=None, max_mi = 1., sec_c = 1e-6):
+# simpler, assumes random seed
+# get a sample of things, compute pairwise distance
+# isotropic noise
+def rand_mechanism_noise( # Random noise
+    train_x: np.ndarray, 
+    train_y: Union[np.ndarray, List[int]], 
+    mechanism: Callable, 
+    subsample_rate: int, 
+    tau: int, 
+    num_classes: int, 
+    regularize: bool = False, 
+    tree_depth: Optional[int] = None,
+    num_trees: Optional[int] = None, 
+    num_dims: Optional[int] = None, 
+    prefix: Optional[str] = None, 
+    max_mi: float = 1., 
+    sec_c: float = 1e-6
+) -> Tuple[float, float, float]:
     v = max_mi / 2.
-    r = calc_r(train_x)
+    r = calc_r(train_x)  # max L2 norm
     gamma = 0.01
     c = sec_c
     num_trials = 1000
@@ -83,23 +115,22 @@ def rand_mechanism_noise(train_x, train_y, mechanism, subsample_rate, tau, num_c
         print(f'trial {trial}')
         assert subsample_rate >= num_classes
         shuffled_x1, shuffled_y1 = shuffle(train_x, train_y)
+        shuffled_x2, shuffled_y2 = shuffle(train_x, train_y)
+
         print(shuffled_x1[0])
         shuffled_x1, shuffled_y1 = get_samples_safe(shuffled_x1, shuffled_y1, num_classes, subsample_rate, ordered=True)
+        shuffled_x2, shuffled_y2 = get_samples_safe(shuffled_x2, shuffled_y2, num_classes, subsample_rate, ordered=True)
 
         indices = [k[1] for k in shuffled_y1.argsort(axis=0)]
+        indices = [k[1] for k in shuffled_y2.argsort(axis=0)]
 
         shuffled_x1 = shuffled_x1[indices]
         shuffled_y1 = shuffled_y1[indices]
-        
-        shuffled_y1 = np.array([k[0] for k in shuffled_y1])
-
-        shuffled_x2, shuffled_y2 = shuffle(train_x, train_y)
-        shuffled_x2, shuffled_y2 = get_samples_safe(shuffled_x2, shuffled_y2, num_classes, subsample_rate, ordered=True)
-
-        indices = [k[1] for k in shuffled_y2.argsort(axis=0)]
 
         shuffled_x2 = shuffled_x2[indices]
         shuffled_y2 = shuffled_y2[indices]
+
+        shuffled_y1 = np.array([k[0] for k in shuffled_y1])
         shuffled_y2 = np.array([k[0] for k in shuffled_y2])
         
         seeds = list(range(tau))
@@ -178,9 +209,14 @@ def rand_mechanism_noise(train_x, train_y, mechanism, subsample_rate, tau, num_c
     avg_dist /= num_trials
 
     avg_cov_norm = (avg_dist + c) / (2*v)
-
+    # avg_dist, c, ((avg_dist + c) / (2*(max_mi / 2.)))
     return (avg_dist, c, avg_cov_norm)
 
+
+# Used for SVM
+# uses deterministic algorithm, fixing random seed
+# pseudorandom provider of anisotropic noise
+# adding noise individually to each of the outputs
 def rand_mechanism_individual_noise(train_x, train_y, mechanism, subsample_rate, tau, num_classes, index, regularize=False, tree_depth=None,
     num_trees=None, prefix=None, max_mi = 1.):
     v = max_mi / 2.
@@ -191,7 +227,7 @@ def rand_mechanism_individual_noise(train_x, train_y, mechanism, subsample_rate,
     avg_dist = 0.
     
     ys = []
-    train_y = [(train_y[k], k) for k in range(len(train_y))]
+    train_y = [(train_y[k], k) for k in range(len(train_y))]  # Pair each label with its index
 
     test_pt_x = train_x[index]
     test_pt_y = train_y[index]
@@ -257,30 +293,35 @@ def rand_mechanism_individual_noise(train_x, train_y, mechanism, subsample_rate,
     
     avg_dist /= num_trials
 
+    # little c is to regularize
     avg_cov_norm = (avg_dist + c) / (2*v)
 
     return (avg_dist, c, avg_cov_norm)
 
-def calc_cov_large_gap(d, c, v, beta, eigs, u):
+def calc_cov_large_gap(d: int, c: float, v: float, beta: float, eigs: np.ndarray, u: np.ndarray) -> np.ndarray:
     sigma_matrix = np.zeros((d, d))
     for i in range(d):
-        num = 2.*v
-        denom_init = (eigs[i] + 10*c*v / beta)**0.5
+        num = 2. * v
+        denom_init = (eigs[i] + 10 * c * v / beta) ** 0.5
         denom_second = 0.
         for k in range(d):
-            denom_second += (eigs[k] + 10*c*v/beta)**0.5
-            denom = denom_init * denom_second
-            sigma_matrix[i][i] = num/denom
-    noise_matrix =  np.matmul(
-        np.matmul(u, np.linalg.inv(sigma_matrix)), u.T)
+            denom_second += (eigs[k] + 10 * c * v / beta) ** 0.5
+        denom = denom_init * denom_second
+        sigma_matrix[i][i] = num / denom
+    noise_matrix = np.matmul(np.matmul(u, np.linalg.inv(sigma_matrix)), u.T)
     return noise_matrix
 
-def calc_cov_small_gap(d, c, v, eigs):
+def calc_cov_small_gap(d: int, c: float, v: float, eigs: np.ndarray) -> np.ndarray:
     identity = np.identity(d)
-    multiplier = sum(eigs) + d*c
-    multiplier /= (2*v)
-    return multiplier*identity
+    multiplier = sum(eigs) + d * c
+    multiplier /= (2 * v)
+    return multiplier * identity
 
+# Generate deterministic noise
+# gives you anisotropic noise
+# complicated, full version would be doing svd
+# find direction using eigenvectors, magnitudes are eigenvalues, adding noise in a fairly complicated way
+# goes with mechanism 1 on the paper
 def det_mechanism_noise(train_x, train_y, mechanism, subsample_rate, num_classes, regularize=None, max_mi = 1.):
 
     sec_v = max_mi / 2
@@ -844,7 +885,7 @@ def infer_cluster_labels(model, actual_labels):
 
     return inferred_labels
 
-def run_kmeans(train_x, train_y, num_clusters, seed):
+def run_kmeans(train_x: np.ndarray, train_y: np.ndarray, num_clusters, seed):
     rand_state = np.random.RandomState(seed)
     model = KMeans(n_clusters=num_clusters, random_state=rand_state, n_init="auto").fit(train_x)
     
@@ -866,7 +907,7 @@ def run_kmeans(train_x, train_y, num_clusters, seed):
 
 # SVM
 
-def run_svm(train_x, train_y, num_classes, seed, regularize):
+def run_svm(train_x: np.ndarray, train_y: np.ndarray, num_classes: int, seed: int, regularize: float) -> Tuple[svm.LinearSVC, np.ndarray]:
     rand_state = np.random.RandomState(seed)
     model = svm.LinearSVC(dual=False, random_state=rand_state, C=regularize)
     model.fit(train_x, train_y)
@@ -879,7 +920,6 @@ def run_svm(train_x, train_y, num_classes, seed, regularize):
         intercept = model.intercept_[0]
     
     else:
-    
         tot = np.zeros((num_classes, num_features))
         intercept = np.zeros((num_classes, 1))
         for ind, c in enumerate(model.classes_):
@@ -891,36 +931,34 @@ def run_svm(train_x, train_y, num_classes, seed, regularize):
 
 # PCA
 
-def gen_pca_data(x_data, end_dim = 10):
+def gen_pca_data(x_data: np.ndarray, end_dim: int = 10) -> np.ndarray:
     init_dim = len(x_data[0])
     assert end_dim % init_dim == 0
     mult_factor = int(end_dim / init_dim)
-    expanded_pts = []
+    expanded_pts: List[List[float]] = []
     for pt in x_data:
-        expanded = []
+        expanded: List[float] = []
         for ind in range(mult_factor):
             if ind == 0:
                 noisy_pt = pt
             else:
                 noisy_pt = pt + np.random.normal(0, 1e-2, init_dim)
             expanded.extend(noisy_pt)
-        expanded_pts.append(expanded)
     return np.array(expanded_pts)
 
-def run_pca(train_x, train_y, num_dims):
+def run_pca(train_x: np.ndarray, train_y: np.ndarray, num_dims: int) -> Tuple[PCA, np.ndarray]:
     model = PCA(n_components=num_dims)
     model.fit(train_x)
     return model, model.components_
 
 # GENERATE DATA (SYNTHETIC)
 
-def gen_synthetic(num_train=10000, num_test=3000, normalize=False):
+def gen_synthetic(num_train: int = 10000, num_test: int = 3000, normalize: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
     num_features = 2
     cluster_std = 0.55
     num_test_samples = num_test
     centers = np.array([[1, -1], [1, 1], [-1, 1], [-1, -1]])
     syn_num_classes = len(centers)
-
 
     syn_train_samples = num_train
     syn_num_classes = len(centers)
@@ -945,7 +983,6 @@ def gen_syn_high_dim(dim, num_train=10000, num_test=3000, normalize=False):
         centers.append(list(item))
     centers = np.array(centers)
     syn_num_classes = len(centers)
-
 
     syn_train_samples = num_train
     syn_num_classes = len(centers)
